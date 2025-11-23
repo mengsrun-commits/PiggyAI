@@ -17,6 +17,9 @@ app = Flask(__name__, template_folder='.', static_folder='static')
 # ==========================================
 # 1. GLOBAL CONFIGURATION & STATE
 # ==========================================
+# Video State
+output_frame = None
+video_lock = threading.Lock()
 MAX_SEQ_LENGTH = 10
 label_names = ["Pneumonia", "Background Noise", "PRRS", "Swine Fever"]
 AUDIO_FOLDER = "test_audio"
@@ -26,12 +29,13 @@ current_pred_color = (255, 255, 255)
 prediction_timestamp = 0
 ai_lock = threading.Lock()
 selected_id = -1 # -1: None, None: All, 0-9: Specific
-flip_mode = -1
+flip_mode = -1 # None: No flip, 0: Vertical, 1: Horizontal, -1: Both
 # Drawing Config
 box_margin = 30         # pixels to expand the marker bounding box
 box_thickness = 3       # thickness of the red box
-DELAY_SECONDS = 2.5     
+DELAY_SECONDS = 1.5     
 CENTER_TOLERANCE = 0.6  # How close to (6.5, 6.5) counts as "center" (in grid units)
+camera_index = 0     # Default camera index, 1 for webcam
 
 # Initialize Audio
 pygame.mixer.init()
@@ -43,6 +47,7 @@ grid_rows = 12
 grid_cols = 12
 show_grid = True
 marker_data = {} # Stores tracking history
+
 ID_TO_FILENAME = {
     1: "pnu_1_noisy.wav", 2: "prrs_17_noisy.wav", 3: "sf_17_noisy.wav",
     4: "pnu_1_slower.wav", 5: "prrs_17_pitch_shifted.wav", 6: "sf_17_shifted.wav",
@@ -276,6 +281,7 @@ def draw_grid(frame, size, cell_size):
         ty = min(ty, size - 2)
         tx = max(2, min(tx, size - tw - 2))
         cv.putText(frame, label, (tx, ty), cv.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
 # ==========================================
 # 4. CORE AI & VIDEO LOGIC
 # ==========================================
@@ -317,15 +323,25 @@ def run_ai_prediction(filename, triggered_id):
         with ai_lock:
             current_pred_text = "Error"
             current_pred_color = (100, 100, 100)
-def generate_frames():
-    global marker_data
-    cap = cv.VideoCapture(1)
+
+def process_video_feed():
+    """
+    Background thread: Reads camera, runs CV logic, updates global 'output_frame'
+    """
+    global output_frame, marker_data, last_static_mic_values, camera_index
+    
+    # Initialize Camera ONCE
+    cap = cv.VideoCapture(camera_index) # Change to 0 if needed
     cap.set(cv.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv.CAP_PROP_FRAME_HEIGHT, 720)
-    actual_w = cap.get(cv.CAP_PROP_FRAME_WIDTH)
-    actual_h = cap.get(cv.CAP_PROP_FRAME_HEIGHT)
-    print(f"Set resolution to 1280x720, actual: {actual_w}x{actual_h}")
+    
     while True:
+        success, frame = cap.read()
+        if not success: 
+            time.sleep(0.1)
+            continue
+            
+        if flip_mode is not None: frame = cv.flip(frame, flip_mode)
         success, frame = cap.read()
         if not success: break
         if flip_mode is not None: frame = cv.flip(frame, flip_mode)
@@ -395,10 +411,29 @@ def generate_frames():
         else:
             draw_sidebar(sidebar, [0,0,0,0])
         dashboard = np.hstack((frame, sidebar))
-        ret, buffer = cv.imencode('.jpg', dashboard)
-        frame_bytes = buffer.tobytes()
+
+        with video_lock:
+            # We encode it here to save CPU for the web threads
+            ret, buffer = cv.imencode('.jpg', dashboard)
+            if ret:
+                output_frame = buffer.tobytes()
+    
+        # Limit framerate slightly to save CPU (optional)
+        time.sleep(0.01)
+
+def generate_frames():
+    """
+    Flask Stream: Just returns the latest global frame
+    """
+    global output_frame
+    while True:
+        with video_lock:
+            if output_frame is None:
+                continue
+            current_bytes = output_frame
+            
         yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+               b'Content-Type: image/jpeg\r\n\r\n' + current_bytes + b'\r\n')
        
 # ==========================================
 # 5. FLASK ROUTES
@@ -481,4 +516,9 @@ def get_status():
         })
    
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    # --- FIX: Start the background thread ---
+    t = threading.Thread(target=process_video_feed, daemon=True)
+    t.start()
+    
+    # --- Run Flask (Turn off debug to prevent duplicate threads) ---
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
